@@ -52,7 +52,7 @@ lib/
 
 assets/
 └── models/
-    └── best_float32.tflite    ← YOUR MODEL FILE GOES HERE
+    └── best_float16.tflite    ← YOUR MODEL FILE GOES HERE
 
 android/
 └── app/
