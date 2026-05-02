@@ -6,47 +6,43 @@ class ClassificationResult {
   final String label;
   final double confidence;
   final int classIndex;
-  final bool isNotLeaf; // ← NEW: true when image is not a tomato leaf
+  final bool isNotLeaf;
 
   ClassificationResult({
     required this.label,
     required this.confidence,
     required this.classIndex,
-    this.isNotLeaf = false, // ← defaults to false so existing code unaffected
+    this.isNotLeaf = false,
   });
 }
 
 class TomatoClassifier {
   // ─────────────────────────────────────────────────────────────────
-  // ✅ CONFIGURATION — adjust these to match your exported model
+  // ✅ CONFIGURATION
   // ─────────────────────────────────────────────────────────────────
 
-  /// Path to your TFLite model inside the assets/models/ folder.
-  /// Make sure the filename matches exactly (case-sensitive).
-  static const String modelPath = 'assets/models/best_float32.tflite';
-
-  /// Input image size your model was trained with (YOLOv8 default = 640).
+  static const String modelPath = 'assets/models/best_float16.tflite';
   static const int inputSize = 224;
 
-  /// Minimum confidence to accept a prediction (0.0 – 1.0).
-  static const double confidenceThreshold = 0.20;
+  // Inference thresholds (matched from web app)
+  static const double confidenceThreshold = 0.65;
+  static const double minMargin = 0.15;
 
-  /// If the top class score after softmax is still below this value,
-  /// the scores are near-uniform (model is confused) → treat as non-leaf.
-  static const double notLeafThreshold = 0.30;
+  // Leaf pixel thresholds — relaxed to handle real phone photos
+  // (hands holding leaf, outdoor backgrounds, shadows etc.)
+  static const double minGreenPixelRatio = 0.12; // was 0.18 — relaxed
+  static const double minLeafPixelRatio = 0.20; // was 0.42 — relaxed
+  static const double maxSkinPixelRatio = 0.55; // was 0.12 — relaxed
 
-  /// Class names in the EXACT order your model was trained.
-  /// YOLOv8 sorts classes alphabetically by default — verify with your
-  /// data.yaml file and reorder here if needed.
+  /// Class names — must match your data.yaml order exactly
   static const List<String> classNames = [
     'Early Blight',
     'Healthy',
     'Late Blight',
+    'Yellow Curl Leaf',
     'Leaf Mold',
     'Septoria Spot',
-    'Yellow Curl Leaf',
   ];
-
   // ─────────────────────────────────────────────────────────────────
 
   Interpreter? _interpreter;
@@ -54,7 +50,6 @@ class TomatoClassifier {
 
   bool get isLoaded => _isLoaded;
 
-  /// Call once at app startup to load the model into memory.
   Future<void> loadModel() async {
     try {
       final options = InterpreterOptions()..threads = 4;
@@ -63,23 +58,18 @@ class TomatoClassifier {
         options: options,
       );
       _isLoaded = true;
-
-      // Print shapes to console for debugging
       print('✅ Model loaded: $modelPath');
       print('   Input  shape: ${_interpreter!.getInputTensor(0).shape}');
       print('   Output shape: ${_interpreter!.getOutputTensor(0).shape}');
     } catch (e) {
       _isLoaded = false;
       print('❌ Failed to load model: $e');
-      print('   → Check that $modelPath exists in your assets folder');
-      print('   → Check pubspec.yaml includes assets/models/');
     }
   }
 
-  /// Run inference on an image file. Returns null on error.
   Future<ClassificationResult?> classify(File imageFile) async {
     if (!_isLoaded || _interpreter == null) {
-      print('⚠️  Classifier not loaded — call loadModel() first');
+      print('⚠️  Classifier not loaded');
       return null;
     }
 
@@ -87,16 +77,11 @@ class TomatoClassifier {
       // 1. Decode image
       final bytes = await imageFile.readAsBytes();
       img.Image? rawImage = img.decodeImage(bytes);
-      if (rawImage == null) {
-        print('⚠️  Could not decode image');
-        return null;
-      }
+      if (rawImage == null) return null;
 
-      // ── NEW: green-pixel pre-check ─────────────────────────────
-      // Tomato leaves are green. If the image has very little green
-      // content, reject it before running the model.
+      // 2. Leaf pre-check
       if (!_hasEnoughGreenContent(rawImage)) {
-        print('🚫 Rejected: not enough green pixels');
+        print('🚫 Rejected: not a leaf');
         return ClassificationResult(
           label: 'Not a Leaf',
           confidence: 0.0,
@@ -104,9 +89,8 @@ class TomatoClassifier {
           isNotLeaf: true,
         );
       }
-      // ──────────────────────────────────────────────────────────
 
-      // 2. Resize to model input size
+      // 3. Resize to 224×224
       img.Image resized = img.copyResize(
         rawImage,
         width: inputSize,
@@ -114,59 +98,26 @@ class TomatoClassifier {
         interpolation: img.Interpolation.linear,
       );
 
-      // 3. Build Float32 input tensor [1, 224, 224, 3]
-      final inputTensor = _imageToFloat32(resized);
+      // 4. NHWC input tensor [1, 224, 224, 3]
+      //    TFLite always uses NHWC regardless of ONNX format
+      final inputTensor = _imageToFloat32NHWC(resized);
 
-      // 4. Build output tensor matching the model's output shape
-      final outputShape = _interpreter!.getOutputTensor(0).shape;
-      final outputSize = outputShape.reduce((a, b) => a * b);
-      final outputFlat = List.filled(outputSize, 0.0);
-      final outputTensor = outputFlat.reshape(outputShape);
+      // 5. Output tensor [1, 6]
+      final outputTensor = [List<double>.filled(classNames.length, 0.0)];
 
-      // 5. Run inference
+      // 6. Run inference
       _interpreter!.run(inputTensor, outputTensor);
 
-      // 6. Parse predictions
-      return _parseOutput(outputTensor, outputShape);
+      // 7. Parse result
+      return _parseOutput(outputTensor[0]);
     } catch (e) {
       print('❌ Inference error: $e');
       return null;
     }
   }
 
-  // ── NEW: green content check ─────────────────────────────────────
-  // Samples a grid of pixels. Returns false if fewer than 8% are "leaf green".
-  bool _hasEnoughGreenContent(img.Image image) {
-    final step = (image.width / 20).round().clamp(1, 999);
-    int green = 0, total = 0;
-
-    for (int y = 0; y < image.height; y += step) {
-      for (int x = 0; x < image.width; x += step) {
-        final p = image.getPixel(x, y);
-        final r = p.r.toInt();
-        final g = p.g.toInt();
-        final b = p.b.toInt();
-        final lum = r + g + b;
-        // Pixel is "leaf green" if green dominates and image isn't
-        // too dark (shadow) or too bright (blown out)
-        if (lum > 60 && lum < 700) {
-          if (g > r && g > b && (g - r) > 10 && (g - b) > 5) {
-            green++;
-          }
-        }
-        total++;
-      }
-    }
-
-    if (total == 0) return false;
-    final ratio = green / total;
-    print('🌿 Green pixel ratio: ${(ratio * 100).toStringAsFixed(1)}%');
-    return ratio >= 0.08; // at least 8% green pixels required
-  }
-  // ─────────────────────────────────────────────────────────────────
-
-  /// Convert an [img.Image] to a nested Float32 list of shape [1,H,W,3].
-  List<List<List<List<double>>>> _imageToFloat32(img.Image image) {
+  // ── NHWC: [1, H, W, 3] — correct format for TFLite ──────────────
+  List<List<List<List<double>>>> _imageToFloat32NHWC(img.Image image) {
     return List.generate(
       1,
       (_) => List.generate(
@@ -186,50 +137,120 @@ class TomatoClassifier {
     );
   }
 
-  /// Handle both classification outputs [1, N] and detection outputs [1, N, M].
-  ClassificationResult? _parseOutput(dynamic output, List<int> shape) {
-    List<double> scores = [];
+  // ── HSV leaf check ────────────────────────────────────────────────
+  bool _hasEnoughGreenContent(img.Image image) {
+    final step = (image.width / 20).round().clamp(1, 999);
+    int green = 0, brown = 0, skin = 0, total = 0;
 
-    if (shape.length == 2 && shape[1] == classNames.length) {
-      // ── Classification export: [1, num_classes] ──────────────────
-      scores = List<double>.from(output[0].map((v) => v.toDouble()));
-    } else if (shape.length == 3) {
-      // ── Detection export: aggregate class scores across anchors ──
-      scores = List.filled(classNames.length, 0.0);
-      final anchors = output[0]; // shape [num_anchors, num_cols]
-      for (var anchor in anchors) {
-        // YOLOv8 detect: first 4 values are box coords, then class scores
-        for (int c = 0; c < classNames.length; c++) {
-          final idx = 4 + c;
-          if (anchor is List && idx < anchor.length) {
-            double score = anchor[idx].toDouble();
-            if (score > scores[c]) scores[c] = score;
+    for (int y = 0; y < image.height; y += step) {
+      for (int x = 0; x < image.width; x += step) {
+        final p = image.getPixel(x, y);
+        final r = p.r / 255.0;
+        final g = p.g / 255.0;
+        final b = p.b / 255.0;
+
+        final maxC = [r, g, b].reduce((a, b) => a > b ? a : b);
+        final minC = [r, g, b].reduce((a, b) => a < b ? a : b);
+        final delta = maxC - minC;
+        final v = maxC;
+        final s = maxC == 0 ? 0.0 : delta / maxC;
+
+        double h = 0;
+        if (delta != 0) {
+          if (maxC == r) {
+            h = ((g - b) / delta) % 6;
+          } else if (maxC == g) {
+            h = (b - r) / delta + 2;
+          } else {
+            h = (r - g) / delta + 4;
           }
+          h *= 60;
+          if (h < 0) h += 360;
         }
+
+        final isGreen = h >= 70 &&
+            h <= 165 &&
+            s >= 0.22 &&
+            v >= 0.18 &&
+            v <= 0.95 &&
+            g > r * 1.05 &&
+            g > b * 1.1;
+
+        final isBrown = h >= 18 &&
+            h <= 48 &&
+            s >= 0.32 &&
+            v >= 0.16 &&
+            v <= 0.7 &&
+            r > g * 1.03 &&
+            g > b * 1.05;
+
+        final isSkin = h >= 0 &&
+            h <= 55 &&
+            s >= 0.18 &&
+            s <= 0.7 &&
+            v >= 0.3 &&
+            r > g &&
+            g > b;
+
+        if (isGreen) green++;
+        if (isBrown) brown++;
+        if (isSkin) skin++;
+        total++;
       }
-    } else {
-      print('⚠️  Unexpected output shape: $shape');
-      print('   → Update _parseOutput() in classifier.dart to match');
-      return null;
     }
 
-    // Softmax normalisation (handles raw logits)
-    double maxScore = scores.reduce((a, b) => a > b ? a : b);
-    double expSum = scores.fold(0.0, (s, v) => s + _safeExp(v - maxScore));
-    List<double> probs =
-        scores.map((v) => _safeExp(v - maxScore) / expSum).toList();
+    if (total == 0) return false;
 
+    final greenRatio = green / total;
+    final leafRatio = (green + brown) / total;
+    final skinRatio = skin / total;
+
+    print('🌿 green=${(greenRatio * 100).toStringAsFixed(1)}%'
+        ' leaf=${(leafRatio * 100).toStringAsFixed(1)}%'
+        ' skin=${(skinRatio * 100).toStringAsFixed(1)}%');
+
+    if (skinRatio > maxSkinPixelRatio) return false;
+    if (leafRatio < minLeafPixelRatio || greenRatio < minGreenPixelRatio) {
+      return false;
+    }
+    return true;
+  }
+
+  // ── Parse model output ────────────────────────────────────────────
+  ClassificationResult? _parseOutput(List<double> rawScores) {
+    // Apply softmax defensively (same as web app)
+    final sum = rawScores.reduce((a, b) => a + b);
+    final isAlreadySoftmax =
+        sum > 0.95 && sum < 1.05 && rawScores.every((v) => v >= 0);
+
+    List<double> probs;
+    if (isAlreadySoftmax) {
+      probs = List<double>.from(rawScores);
+    } else {
+      final maxScore = rawScores.reduce((a, b) => a > b ? a : b);
+      final expVals = rawScores.map((v) => _safeExp(v - maxScore)).toList();
+      final expSum = expVals.reduce((a, b) => a + b);
+      probs = expVals.map((v) => v / expSum).toList();
+    }
+
+    // Best class
     int bestIdx = 0;
     for (int i = 1; i < probs.length; i++) {
       if (probs[i] > probs[bestIdx]) bestIdx = i;
     }
-    double confidence = probs[bestIdx];
+    final confidence = probs[bestIdx];
 
-    print('🔍 Top: ${classNames[bestIdx]} — ${(confidence * 100).toStringAsFixed(1)}%');
+    // Margin between top and second
+    final sorted = List<double>.from(probs)..sort((a, b) => b.compareTo(a));
+    final margin = sorted[0] - sorted[1];
 
-    // ── NEW: second layer — if model is still confused, reject ────
-    if (confidence < notLeafThreshold) {
-      print('🚫 Rejected: model confidence too low (not a leaf)');
+    print('🔍 Top: ${classNames[bestIdx]}'
+        ' — ${(confidence * 100).toStringAsFixed(1)}%'
+        ' margin=${(margin * 100).toStringAsFixed(1)}%');
+
+    // Low confidence → not a leaf
+    if (confidence < confidenceThreshold) {
+      print('🚫 Low confidence — showing as Not a Leaf');
       return ClassificationResult(
         label: 'Not a Leaf',
         confidence: confidence,
@@ -237,9 +258,10 @@ class TomatoClassifier {
         isNotLeaf: true,
       );
     }
-    // ─────────────────────────────────────────────────────────────
 
-    if (confidence < confidenceThreshold) {
+    // Too close between classes → uncertain
+    if (margin < minMargin) {
+      print('🚫 Ambiguous result');
       return ClassificationResult(
         label: 'Uncertain',
         confidence: confidence,
